@@ -6,6 +6,12 @@
   被摘要固定的内容不随标签迁移改变或丢失。
 - 多架构索引 → 平台清单的**严格**解析；缺平台、清单截断、摘要不符分别以
   可区分错误拒绝，不回退其它平台。
+- **多平台发现与批量解析**（预热/同步场景）：`Discover` 稳定列出标签/摘要下的
+  全部平台（单平台镜像也有统一的单条目结果）；`PlatformSelector` 支持只给部分
+  条件筛选（没给的维度不参与比较、候选多写信息不被排除），多命中按
+  “额外信息少者优先 + 规范键 + 原始位置”确定性择优；`ResolveAllPlatforms` /
+  `ResolvePlatforms` 一次准备多平台的清单与层，逐平台隔离失败，并与标签迁移/
+  删除/GC 并发保持一致（整批 Pin 保护，不串版本、不读到半成品）。
 - 内容寻址完整性校验：任何读取路径摘要不符都报错，并把损坏内容隔离，
   不再作为缓存命中。
 - 并发安全（singleflight 去重、原子 rename 发布），竞态检测测试通过。
@@ -52,6 +58,32 @@ func main() {
         ocistore.Platform{OS: "linux", Architecture: "amd64"})
     fmt.Println(img.Manifest.Layers)
 
+    // 3a) 发现：稳定列出一个标签/摘要下的全部平台
+    //     （若是单平台镜像，IsIndex=false 且恰有一个占位条目，不报错）
+    disc, _ := s.Discover(ctx, "myrepo/app:v1")
+    for _, p := range disc.Platforms {
+        fmt.Println(p.Platform, p.Descriptor.Digest)
+    }
+
+    // 3b) 按部分条件挑平台：只有显式给出的维度才算约束
+    //     多命中时确定性择优（额外信息少者优先 → 规范键 → 原始位置）
+    sel := ocistore.PlatformSelector{}.
+        WithOS("linux").
+        WithArchitecture("arm64") // 没给 variant：v7/v8 都候选，择优确定
+    one, err := ocistore.SelectPlatform(disc.Index, sel) // 纯函数
+    _ = one
+
+    // 3c) 批量解析：一次准备全部平台（或一批条件），逐平台隔离失败
+    batch, _ := s.ResolveAllPlatforms(ctx, "myrepo/app:v1")
+    for _, p := range batch.Platforms {
+        if p.Err != nil { // 单个平台失败不连累其它平台
+            fmt.Println("failed:", p.Name, p.Err)
+            continue
+        }
+        fmt.Printf("%s layers=%d size=%d\n", p.Name, p.LayerCount, p.SizeBytes)
+    }
+    _ = batch.Failed() // 一次收集所有失败平台
+
     // 4) 并发拉取保护：先 Pin 再取，完成后 Unpin
     _ = s.Pin(cur)
     defer s.Unpin(cur)
@@ -87,12 +119,17 @@ func main() {
 
 ```bash
 # 全量单测（含重复写入、标签迁移、摘要不匹配、平台缺失、截断、
-# 未知媒体类型、配额、损坏隔离、并发读写、GC 与拉取竞态）
+# 未知媒体类型、配额、损坏隔离、并发读写、GC 与拉取竞态，
+# 以及平台发现、部分条件筛选、确定性择优、批量部分失败、
+# 批量 vs 标签迁移/删除+GC 并发）
 go test ./... -v
 
 # 竞态检测 + 重复执行以稳定复现/排除竞态
 go test -race ./...
 go test -race -count=10 ./...
+
+# 只跑新增的多平台能力用例
+go test ./... -v -run 'TestDiscover|TestSelector|TestResolveAll|TestResolvePlatforms|TestBatch|TestConcurrentBatch'
 
 # 静态检查
 go vet ./...

@@ -227,6 +227,18 @@ func (s *Store) quarantine(badPath string, d Digest) {
 // blobData 读取并校验 blob。校验失败的内容被隔离并返回 ErrCorrupted，
 // 之后任何路径都无法再把它当作命中结果。
 func (s *Store) blobData(d Digest) ([]byte, error) {
+	return s.blobDataLocked(d, true)
+}
+
+// blobDataGCLocked 与 blobData 相同，但调用方已持有 gcmu
+// （损坏隔离的 rename 与 GC 扫描互斥由调用方保证），避免重入死锁。
+func (s *Store) blobDataGCLocked(d Digest) ([]byte, error) {
+	return s.blobDataLocked(d, false)
+}
+
+// blobDataLocked 读取并校验 blob。lockGC=true 时由本函数负责获取 gcmu
+// 完成损坏隔离；否则调用方必须已持有 gcmu。
+func (s *Store) blobDataLocked(d Digest, lockGC bool) ([]byte, error) {
 	if _, err := ParseDigest(string(d)); err != nil {
 		return nil, err
 	}
@@ -240,9 +252,13 @@ func (s *Store) blobData(d Digest) ([]byte, error) {
 	}
 	if !d.Verify(data) {
 		// 判定损坏：隔离，防止后续缓存命中；返回可区分错误。
-		s.gcmu.Lock()
+		if lockGC {
+			s.gcmu.Lock()
+		}
 		s.quarantine(path, d)
-		s.gcmu.Unlock()
+		if lockGC {
+			s.gcmu.Unlock()
+		}
 		return nil, fmt.Errorf("%w: %s", ErrCorrupted, d)
 	}
 	return data, nil

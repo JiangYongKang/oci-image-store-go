@@ -112,3 +112,100 @@
 - `mu` 保护配额/发布一致性，`gcmu` 串行化 GC 与发布、标签变更，`pinmu` 保护 Pin 计数。
 - 测试在 `-race` 下覆盖：同内容并发写、迁移期间并发读、共享层多清单并发写、
   以及 30 轮"并发拉取 vs 删标签 + GC"竞态。
+
+## 8. 多平台发现、按条件筛选与批量解析
+
+面向镜像预热/同步场景新增一层能力，三个入口都在原有内容寻址与校验语义之上，
+不放宽任何严格性：
+
+- `Discover(ctx, ref)`：发现一个标签/摘要下到底有哪些平台；
+- `SelectPlatform(idx, sel)`：按“部分条件”在索引里择优挑一个平台（纯函数，便于单测/复用）；
+- `ResolveAllPlatforms(ctx, ref)` / `ResolvePlatforms(ctx, ref, sels)`：
+  一次把一个或多个平台的镜像清单与层全部准备好。
+
+### 8.1 发现（Discover）
+
+- `ref` 为 `sha256:...` 按摘要定位，否则按标签定位。
+- 引用是**多架构索引**时：`DiscoverResult.IsIndex=true`，`Platforms` 列出每个带
+  `platform` 描述的条目，包含系统、架构以及变体（variant）、系统版本（os.version）、
+  系统特性（os.features）、架构特性（features）等可选信息。
+- 引用是**单个平台镜像清单**时：不报错，返回 `IsIndex=false` 且 `Platforms` 恰好
+  一个占位条目——其 `Descriptor` 指向清单本身（带媒体类型/大小/摘要），`Platform`
+  为零值（单清单本身不携带独立平台描述）。这样调用方拿到的始终是统一结构，
+  不必靠猜错误来区分“索引 vs 单镜像”。
+- **顺序稳定可复现**：平台按规范键排序，键的比较顺序为
+  `os → architecture → variant → os.version → os.features(排序后) → features(排序后) → 条目摘要`；
+  键完全相同再回退到原始索引位置。标签引用与摘要引用得到的顺序一致。
+- 索引中存在摘要非法的条目，返回 `ErrPlatformBad`（清单本身有问题）。
+- 没有 `platform` 字段的条目（例如 attestation/证明材料）不计入平台清单。
+
+### 8.2 条件语义（PlatformSelector）
+
+`PlatformSelector` 的每个维度都是“显式给出才算约束”：
+
+| 维度 | 构造器 | 不给（不调用） | 给出时 |
+|---|---|---|---|
+| 系统 OS | `WithOS` | 不参与比较 | 必须相等 |
+| 架构 Architecture | `WithArchitecture` | 不参与比较 | 必须相等 |
+| 系统版本 OSVersion | `WithOSVersion` | 不参与比较 | 必须相等 |
+| 变体 Variant | `WithVariant` | 不参与比较 | 必须相等 |
+| 系统特性 OSFeatures | `WithOSFeatures(...)` | 不参与比较 | 候选须**包含全部**给定特性 |
+| 架构特性 Features | `WithFeatures(...)` | 不参与比较 | 候选须**包含全部**给定特性 |
+
+要点：
+
+- **没给的维度一律不参与相等判断**。例如只给 `WithOS("linux")` 时，架构、变体、
+  系统版本等完全不比较；给了 `os+arch` 但没给 `variant`，则 v7/v8 候选都算命中。
+- 特性是**子集语义**：要求 `sse4` 时，携带 `sse4+avx` 的候选仍然命中——
+  “候选多写了几个没被要求的信息”不会因此被排除。
+- 空选择器 `PlatformSelector{}` 表示不加任何条件（全部候选都满足）。
+
+### 8.3 多命中时的确定性择优
+
+`SelectPlatform` 在多个候选同时满足条件时，按以下顺序确定唯一结果，绝不随机：
+
+1. **额外信息量少者优先**：候选在“未被条件约束的可选维度”上携带的信息越少越靠前。
+   `variant`、`os.version` 非空各计 1；未要求的 `os.features`/`features` 按多出的
+   个数计（OS/架构属身份维度，不计）。
+   例：只要 `arch=arm64`、不给变体时，朴素的 `arm64/v8`（surplus=0）胜过
+   带了 `os.version+os.features` 的 `arm64/v7`（surplus=2）。
+2. **规范键字典序**：额外量相同则按 8.1 的规范键比较（os/arch/variant/.../摘要）。
+3. **原始位置**：仍相同则取索引中更靠前的条目。
+
+两类失败严格分开，可用 `errors.Is` 判断：
+
+- 条件筛不到任何候选 → `ErrPlatformNoMatch`；
+- 清单本身有问题（条目摘要非法等）→ `ErrPlatformBad`。
+
+### 8.4 批量解析（ResolveAllPlatforms / ResolvePlatforms）
+
+- `ResolveAllPlatforms`：解析发现到的**全部**平台（顺序同 Discover）。
+- `ResolvePlatforms(ref, sels)`：按一批条件**逐个择优**解析，结果顺序与请求一致，
+  允许重复条件。
+- 每个平台条目 `ResolvedPlatform` 给出：稳定名字（`os/arch[/variant]`；单镜像为
+  根摘要前 12 位）、命中的描述符与平台、镜像清单、`Layers`（保序）、`LayerCount`、
+  `SizeBytes`（各层声明大小之和）。
+- **逐平台隔离失败**：某个平台子清单缺失/损坏/是嵌套索引/条件无命中，只在该条目的
+  `Err` 上体现（可用 `BatchResult.Failed()` 一次收集），同批其它平台结果照常可用；
+  顶层 `error` 只用于“整批无法开始”的情况（标签不存在 `ErrLabelNotExist`、
+  根内容缺失/损坏、根 JSON 非法、索引条目摘要非法）。
+- 单平台镜像：`BatchResult.IsIndex=false`，结果恰有一个条目；用带约束的条件去
+  `ResolvePlatforms` 时会得到该位置的 `ErrPlatformNoMatch`（占位条目没有平台描述），
+  空条件则正常解析。
+
+### 8.5 与标签迁移 / 删除 / GC 并发时的一致性
+
+批量解析在内部遵循与手动拉取相同的保护协议：
+
+1. 在 `gcmu` 冻结窗口内完成“解析标签 → 读取并校验根清单 → `Pin(root)`”，
+   因此“已解析到根但还没建立保护”这种能被 GC 插入的窗口不存在。
+2. Pin 之后，该根可达的整棵子图（索引条目、子清单、config、层）都不会被 GC 回收；
+   标签随后被迁移或删除也不影响本次结果——**结果锚定在根摘要上**，
+   不会出现“根来自版本 A、条目来自版本 B”的串版本读取。
+3. 根清单与 blob 都经原子发布 + 全量校验，读者不可能读到写了一半的内容。
+4. 解析结束统一 `Unpin(root)`；单个平台失败不影响保护范围，也不留半成品。
+
+兼容范围与 `FetchPlatform` 一致：OCI 与 Docker v2 清单/索引媒体类型、省略媒体类型时
+的结构嗅探、额外字段容忍；显式未知媒体类型、嵌套索引、截断 JSON 仍分别以
+`ErrMediaType` / `ErrManifestBadJSON` 拒绝。
+
