@@ -6,6 +6,11 @@
   被摘要固定的内容不随标签迁移改变或丢失。
 - 多架构索引 → 平台清单的**严格**解析；缺平台、清单截断、摘要不符分别以
   可区分错误拒绝，不回退其它平台。
+- **多平台发现、按条件筛选与批量解析**（预热/同步场景）：列出标签/摘要下
+  全部平台（单平台镜像也有统一结果，顺序稳定可复现）；部分条件匹配
+  （没给的维度不参与比较、候选多写信息不被排除、多命中按内容定义顺序
+  全返回）；一次批量准备多平台清单与层，逐平台报告层数/总大小/失败原因，
+  部分失败不连累其它平台，与标签迁移/删除/GC 并发时基于 Pin 快照保持一致。
 - 内容寻址完整性校验：任何读取路径摘要不符都报错，并把损坏内容隔离，
   不再作为缓存命中。
 - 并发安全（singleflight 去重、原子 rename 发布），竞态检测测试通过。
@@ -52,6 +57,39 @@ func main() {
         ocistore.Platform{OS: "linux", Architecture: "amd64"})
     fmt.Println(img.Manifest.Layers)
 
+    // 3a) 发现：列出标签/摘要下的全部平台（单平台镜像返回 KindManifest + 一条）
+    disc, _ := s.DiscoverPlatforms(ctx, "myrepo/app:v1")
+    for _, e := range disc.Entries { // 顺序 = 索引 manifests 的内容定义顺序，稳定可复现
+        fmt.Println(disc.Kind, e.Index, e.Platform)
+    }
+
+    // 3b) 按部分条件筛选：只有显式设置的维度才参与比较
+    q := ocistore.NewPlatformSelector().WithOS("linux").WithArchitecture("arm64")
+    _, hits, err := s.SelectPlatforms(ctx, "myrepo/app:v1", q)
+    if err != nil { /* 清单本身有问题（缺失/损坏/非法条目） */ }
+    // len(hits)==0 且 err==nil 表示合法清单但没有条件命中——与清单错误区分
+    for _, h := range hits { // 多命中按内容定义顺序全部返回，不随机二选一
+        fmt.Println(h.Entry.Platform)
+    }
+
+    // 3c) 批量解析：一次准备多组条件命中平台的并集（去重，保序）
+    res, _ := s.BatchResolve(ctx, "myrepo/app:v1", []*ocistore.PlatformSelector{
+        ocistore.NewPlatformSelector().WithOS("linux").WithArchitecture("amd64"),
+        ocistore.NewPlatformSelector().WithOS("linux").WithArchitecture("arm64"),
+    })
+    for _, p := range res.Unmatched { // 这些条件没命中任何平台（不是错误）
+        fmt.Println("unmatched selector index:", p)
+    }
+    for _, pi := range res.Images { // 逐平台独立成败
+        if pi.Err != nil {
+            fmt.Println("platform failed (others unaffected):", pi.Entry.Platform, pi.Err)
+            continue
+        }
+        fmt.Println(pi.Entry.Platform, "layers=", pi.LayerCount, "bytes=", pi.TotalSize)
+    }
+    // 只想一次准备全部平台：
+    // res, _ := s.ResolveAllPlatforms(ctx, "myrepo/app:v1")
+
     // 4) 并发拉取保护：先 Pin 再取，完成后 Unpin
     _ = s.Pin(cur)
     defer s.Unpin(cur)
@@ -87,7 +125,9 @@ func main() {
 
 ```bash
 # 全量单测（含重复写入、标签迁移、摘要不匹配、平台缺失、截断、
-# 未知媒体类型、配额、损坏隔离、并发读写、GC 与拉取竞态）
+# 未知媒体类型、配额、损坏隔离、并发读写、GC 与拉取竞态，
+# 以及多平台发现/部分条件筛选/多命中择优/批量部分失败/
+# 批量与标签迁移+GC 并发竞态）
 go test ./... -v
 
 # 竞态检测 + 重复执行以稳定复现/排除竞态
