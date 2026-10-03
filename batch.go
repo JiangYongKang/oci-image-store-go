@@ -31,10 +31,13 @@ type PlatformImage struct {
 // BatchResult 是一次批量解析的整体结果。
 //
 //   - Images：去重后实际准备的平台，顺序与发现顺序一致（即索引 manifests 的
-//     内容定义顺序）；多个条件命中同一平台清单时只准备一次。
+//     内容定义顺序）；多个条件择中同一份平台清单时只准备一次。
 //   - Unmatched：提交的条件中没有命中任何平台的条件下标（升序）。它与
 //     Images[i].Err 表达两类不同问题：前者是"条件没筛中"，后者是"筛中了但
 //     内容准备失败"。
+//
+// 索引中没有 platform 信息的附属条目（签名、证明材料等）不构成平台：既不
+// 出现在 Images 里，也不混入平台数量、层数与总大小统计。
 type BatchResult struct {
 	Kind      string
 	Root      Digest
@@ -44,14 +47,18 @@ type BatchResult struct {
 
 // BatchResolve 一次提交多组部分条件：
 //
-//  1. 先发现引用下的全部平台，再按每个条件挑选命中平台，取并集并按清单摘要
-//     去重（同一份镜像清单不重复准备）；没有命中任何平台的条件下标记入
-//     Unmatched，不构成错误；
-//  2. 对每个命中平台独立解析：读取子清单、拒绝嵌套索引、校验 config 与全部层，
+//  1. 先发现引用下的全部平台（无 platform 的附属条目在发现阶段即被排除），
+//     再对每个条件按确定性择优规则选出唯一一个平台（规则见 SelectPlatform），
+//     按清单摘要去重（同一平台被多个条件择中也只准备一次）；没有命中任何
+//     平台的条件下标记入 Unmatched，不构成错误；
+//  2. 对每个择中平台独立解析：读取子清单、拒绝嵌套索引、校验 config 与全部层，
 //     汇总层数与总大小；单个平台失败只标记该 PlatformImage.Err，不连累其它平台；
 //  3. 整次批量基于一个被 Pin 保护的摘要快照：标签迁移/删除只影响名字指针，
 //     GC 因根 Pin 及其引用边不会回收解析链上的任何内容，因此批量不会读到
 //     写了一半的内容，也不会出现"清单在、层被回收"的悬空引用。
+//
+// 不传任何条件（nil/空切片）表示准备发现到的全部平台，等价于
+// ResolveAllPlatforms；附属条目同样不在准备范围内。
 func (s *Store) BatchResolve(ctx context.Context, ref string, selectors []*PlatformSelector) (*BatchResult, error) {
 	// 阶段 1：发现。得到一个由摘要固定的内容定义快照；之后标签如何迁移都与本批无关。
 	disc, err := s.DiscoverPlatforms(ctx, ref)
@@ -73,10 +80,22 @@ func (s *Store) BatchResolve(ctx context.Context, ref string, selectors []*Platf
 	s.gcmu.Unlock()
 	defer func() { _ = s.Unpin(disc.Root) }()
 
-	// 阶段 3：按条件挑选，取并集并去重（保持发现顺序）。
+	// 阶段 3：每个条件择优选一个平台，取并集并去重（保持发现顺序）。
 	want := map[Digest]bool{}
 	var order []Digest
 	unmatched := []int{}
+	pickFor := func(q *PlatformSelector) (PlatformEntry, bool) {
+		var cands []PlatformEntry
+		for _, e := range disc.Entries {
+			if q.match(e.Platform) {
+				cands = append(cands, e)
+			}
+		}
+		if len(cands) == 0 {
+			return PlatformEntry{}, false
+		}
+		return q.pickBest(cands), true
+	}
 	if len(selectors) == 0 {
 		for _, e := range disc.Entries {
 			if !want[e.Descriptor.Digest] {
@@ -86,19 +105,14 @@ func (s *Store) BatchResolve(ctx context.Context, ref string, selectors []*Platf
 		}
 	} else {
 		for ci, q := range selectors {
-			hits := 0
-			for _, e := range disc.Entries {
-				if !q.empty() && !q.match(e.Platform) {
-					continue
-				}
-				hits++
-				if !want[e.Descriptor.Digest] {
-					want[e.Descriptor.Digest] = true
-					order = append(order, e.Descriptor.Digest)
-				}
-			}
-			if hits == 0 {
+			best, hit := pickFor(q)
+			if !hit {
 				unmatched = append(unmatched, ci)
+				continue
+			}
+			if !want[best.Descriptor.Digest] {
+				want[best.Descriptor.Digest] = true
+				order = append(order, best.Descriptor.Digest)
 			}
 		}
 	}
