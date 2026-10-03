@@ -6,11 +6,13 @@
   被摘要固定的内容不随标签迁移改变或丢失。
 - 多架构索引 → 平台清单的**严格**解析；缺平台、清单截断、摘要不符分别以
   可区分错误拒绝，不回退其它平台。
-- **多平台发现、按条件筛选与批量解析**（预热/同步场景）：列出标签/摘要下
-  全部平台（单平台镜像也有统一结果，顺序稳定可复现）；部分条件匹配
-  （没给的维度不参与比较、候选多写信息不被排除、多命中按内容定义顺序
-  全返回）；一次批量准备多平台清单与层，逐平台报告层数/总大小/失败原因，
-  部分失败不连累其它平台，与标签迁移/删除/GC 并发时基于 Pin 快照保持一致。
+- **多平台发现、按条件挑选与批量解析**（预热/同步场景）：列出标签/摘要下
+  全部真正声明了平台的条目（签名/证明材料等无平台附属条目自动排除；单平台
+  镜像也有统一结果，顺序稳定可复现）；部分条件匹配（没给的维度不参与比较、
+  候选多写信息不被排除，多命中按"额外特化更少、再按索引顺序"**直接选定
+  唯一结果**，不需要调用方二次选择，没筛中是正常空结果而非错误）；一次批量
+  准备多平台清单与层，逐平台报告层数/总大小/失败原因，部分失败不连累其它
+  平台、不留半成品，与标签迁移/删除/GC 并发时基于 Pin 快照保持一致。
 - 内容寻址完整性校验：任何读取路径摘要不符都报错，并把损坏内容隔离，
   不再作为缓存命中。
 - 并发安全（singleflight 去重、原子 rename 发布），竞态检测测试通过。
@@ -57,27 +59,30 @@ func main() {
         ocistore.Platform{OS: "linux", Architecture: "amd64"})
     fmt.Println(img.Manifest.Layers)
 
-    // 3a) 发现：列出标签/摘要下的全部平台（单平台镜像返回 KindManifest + 一条）
+    // 3a) 发现：列出标签/摘要下的全部"真正平台"（无平台的签名/证明等附属
+    //     条目不列出）；单平台镜像返回 KindManifest + 一条
     disc, _ := s.DiscoverPlatforms(ctx, "myrepo/app:v1")
     for _, e := range disc.Entries { // 顺序 = 索引 manifests 的内容定义顺序，稳定可复现
         fmt.Println(disc.Kind, e.Index, e.Platform)
     }
 
-    // 3b) 按部分条件筛选：只有显式设置的维度才参与比较
+    // 3b) 按部分条件挑选唯一一个平台：只有显式设置的维度才参与比较
     q := ocistore.NewPlatformSelector().WithOS("linux").WithArchitecture("arm64")
-    _, hits, err := s.SelectPlatforms(ctx, "myrepo/app:v1", q)
-    if err != nil { /* 清单本身有问题（缺失/损坏/非法条目） */ }
-    // len(hits)==0 且 err==nil 表示合法清单但没有条件命中——与清单错误区分
-    for _, h := range hits { // 多命中按内容定义顺序全部返回，不随机二选一
-        fmt.Println(h.Entry.Platform)
+    _, hit, err := s.SelectPlatform(ctx, "myrepo/app:v1", q)
+    if err != nil { /* 清单本身有问题（缺失/损坏/非法或残缺条目） */ }
+    if hit == nil {
+        // 合法清单但条件没筛中：不是错误；附属条目也永远不会被选中
+    } else {
+        // 多命中时接口已按确定规则选好：额外特化更少者优先，相同按索引顺序
+        fmt.Println(hit.Entry.Platform)
     }
 
-    // 3c) 批量解析：一次准备多组条件命中平台的并集（去重，保序）
+    // 3c) 批量解析：每组条件各自择优一个平台，取并集（去重，按发现顺序）
     res, _ := s.BatchResolve(ctx, "myrepo/app:v1", []*ocistore.PlatformSelector{
         ocistore.NewPlatformSelector().WithOS("linux").WithArchitecture("amd64"),
-        ocistore.NewPlatformSelector().WithOS("linux").WithArchitecture("arm64"),
+        ocistore.NewPlatformSelector().WithArchitecture("arm64"),
     })
-    for _, p := range res.Unmatched { // 这些条件没命中任何平台（不是错误）
+    for _, p := range res.Unmatched { // 这些条件没选中任何平台（不是错误）
         fmt.Println("unmatched selector index:", p)
     }
     for _, pi := range res.Images { // 逐平台独立成败
@@ -87,7 +92,7 @@ func main() {
         }
         fmt.Println(pi.Entry.Platform, "layers=", pi.LayerCount, "bytes=", pi.TotalSize)
     }
-    // 只想一次准备全部平台：
+    // 只想一次准备全部真正平台（附属条目自动不参与）：
     // res, _ := s.ResolveAllPlatforms(ctx, "myrepo/app:v1")
 
     // 4) 并发拉取保护：先 Pin 再取，完成后 Unpin
@@ -116,7 +121,7 @@ func main() {
 | `ErrManifestBadJSON` | 清单截断或不是合法 JSON |
 | `ErrMediaType` | 显式声明了不支持的媒体类型 / 嵌套索引 / 无法推断类型 |
 | `ErrPlatformNoMatch` | 索引中无请求平台（不回退） |
-| `ErrPlatformBad` | 索引条目摘要非法等坏描述符 |
+| `ErrPlatformBad` | 索引条目摘要非法、或声明了平台但 os/architecture 残缺等坏描述符 |
 | `ErrQuotaExceeded` | 写入将使占用超过配额 |
 
 详细设计见 [`docs/STORAGE.md`](docs/STORAGE.md)。
@@ -126,8 +131,8 @@ func main() {
 ```bash
 # 全量单测（含重复写入、标签迁移、摘要不匹配、平台缺失、截断、
 # 未知媒体类型、配额、损坏隔离、并发读写、GC 与拉取竞态，
-# 以及多平台发现/部分条件筛选/多命中择优/批量部分失败/
-# 批量与标签迁移+GC 并发竞态）
+# 以及无平台附属条目排除、残缺平台报错、部分条件确定性择优、
+# 批量部分失败、批量（全部+条件）与标签迁移+GC 并发竞态）
 go test ./... -v
 
 # 竞态检测 + 重复执行以稳定复现/排除竞态

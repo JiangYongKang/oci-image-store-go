@@ -31,8 +31,9 @@ type PlatformImage struct {
 // BatchResult 是一次批量解析的整体结果。
 //
 //   - Images：去重后实际准备的平台，顺序与发现顺序一致（即索引 manifests 的
-//     内容定义顺序）；多个条件命中同一平台清单时只准备一次。
-//   - Unmatched：提交的条件中没有命中任何平台的条件下标（升序）。它与
+//     内容定义顺序）；多个条件择优到同一平台清单时只准备一次。无平台信息的
+//     附属条目从不出现在这里，层数与总大小也不会混入它们的数据。
+//   - Unmatched：提交的条件中没有选中任何平台的条件下标（升序）。它与
 //     Images[i].Err 表达两类不同问题：前者是"条件没筛中"，后者是"筛中了但
 //     内容准备失败"。
 type BatchResult struct {
@@ -44,12 +45,16 @@ type BatchResult struct {
 
 // BatchResolve 一次提交多组部分条件：
 //
-//  1. 先发现引用下的全部平台，再按每个条件挑选命中平台，取并集并按清单摘要
-//     去重（同一份镜像清单不重复准备）；没有命中任何平台的条件下标记入
+//  1. 先发现引用下的全部平台——只有真正声明了平台的条目才会出现，签名/证明
+//     材料等无平台附属条目既不在候选集合中，也不参与层数与总大小统计；
+//  2. 对每个条件按 SelectPlatform 的确定性择优规则（额外特化更少优先，再按
+//     索引内容定义顺序）选出唯一一个平台；多组条件选中同一清单时只准备一次
+//     （按清单摘要去重，保持发现顺序）；没有选中任何平台的条件下标记入
 //     Unmatched，不构成错误；
-//  2. 对每个命中平台独立解析：读取子清单、拒绝嵌套索引、校验 config 与全部层，
+//     不传任何条件（selectors 为空）表示准备发现到的全部平台；
+//  3. 对每个选中平台独立解析：读取子清单、拒绝嵌套索引、校验 config 与全部层，
 //     汇总层数与总大小；单个平台失败只标记该 PlatformImage.Err，不连累其它平台；
-//  3. 整次批量基于一个被 Pin 保护的摘要快照：标签迁移/删除只影响名字指针，
+//  4. 整次批量基于一个被 Pin 保护的摘要快照：标签迁移/删除只影响名字指针，
 //     GC 因根 Pin 及其引用边不会回收解析链上的任何内容，因此批量不会读到
 //     写了一半的内容，也不会出现"清单在、层被回收"的悬空引用。
 func (s *Store) BatchResolve(ctx context.Context, ref string, selectors []*PlatformSelector) (*BatchResult, error) {
@@ -73,7 +78,7 @@ func (s *Store) BatchResolve(ctx context.Context, ref string, selectors []*Platf
 	s.gcmu.Unlock()
 	defer func() { _ = s.Unpin(disc.Root) }()
 
-	// 阶段 3：按条件挑选，取并集并去重（保持发现顺序）。
+	// 阶段 3：每个条件择优唯一一个平台，取并集并去重（保持发现顺序）。
 	want := map[Digest]bool{}
 	var order []Digest
 	unmatched := []int{}
@@ -86,29 +91,31 @@ func (s *Store) BatchResolve(ctx context.Context, ref string, selectors []*Platf
 		}
 	} else {
 		for ci, q := range selectors {
-			hits := 0
-			for _, e := range disc.Entries {
-				if !q.empty() && !q.match(e.Platform) {
-					continue
-				}
-				hits++
-				if !want[e.Descriptor.Digest] {
-					want[e.Descriptor.Digest] = true
-					order = append(order, e.Descriptor.Digest)
-				}
+			best := selectBest(disc.Entries, q)
+			if best == nil {
+				unmatched = append(unmatched, ci) // 条件没筛中：正常空结果，不是错误
+				continue
 			}
-			if hits == 0 {
-				unmatched = append(unmatched, ci)
+			if !want[best.Descriptor.Digest] {
+				want[best.Descriptor.Digest] = true
+				order = append(order, best.Descriptor.Digest)
 			}
 		}
 	}
 	sort.Ints(unmatched)
 	entryByDigest := map[Digest]PlatformEntry{}
-	for _, e := range disc.Entries {
+	posByDigest := map[Digest]int{}
+	for i, e := range disc.Entries {
 		if _, exists := entryByDigest[e.Descriptor.Digest]; !exists {
 			entryByDigest[e.Descriptor.Digest] = e
+			posByDigest[e.Descriptor.Digest] = i
 		}
 	}
+	// 结果顺序固定为发现顺序，与条件的提交顺序无关：同一组平台无论以什么
+	// 顺序提交条件，批量结果都完全一致。
+	sort.Slice(order, func(i, j int) bool {
+		return posByDigest[order[i]] < posByDigest[order[j]]
+	})
 
 	// 阶段 4：逐平台独立准备；任何一个失败都只记入该项，不影响其它平台。
 	res := &BatchResult{Kind: disc.Kind, Root: disc.Root, Unmatched: unmatched}

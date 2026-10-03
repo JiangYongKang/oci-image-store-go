@@ -62,31 +62,42 @@
    - 选定镜像清单后，继续校验其 `config` 与所有 `layers` 存在且完好，
      任一损坏/缺失都使整次拉取失败。
 
-## 4. 多平台发现、条件筛选与批量解析
+## 4. 多平台发现、条件挑选与批量解析
 
 面向镜像预热/同步场景，在单平台 `FetchPlatform` 之上提供一组只读 API：
 
 | API | 作用 |
 |---|---|
-| `DiscoverPlatforms(ctx, ref)` | 列出引用包含的**全部平台描述** |
-| `SelectPlatforms(ctx, ref, q)` | 按**部分条件**挑平台，返回全部命中 |
-| `BatchResolve(ctx, ref, qs)` | 一次按多组条件准备各平台清单与层 |
+| `DiscoverPlatforms(ctx, ref)` | 列出引用包含的**全部真正平台描述**（无平台附属条目排除） |
+| `SelectPlatform(ctx, ref, q)` | 按**部分条件**直接挑出唯一一个最合适的平台 |
+| `BatchResolve(ctx, ref, qs)` | 每组条件各自择优一个平台，一次准备其清单与层 |
 | `ResolveAllPlatforms(ctx, ref)` | `BatchResolve` 的"全部平台"快捷方式 |
 
 ### 4.1 发现（DiscoverPlatforms）
 
-- 引用是**多架构索引**（`Kind="index"`）：每个 `manifests` 条目对应一个
+- 引用是**多架构索引**（`Kind="index"`）：只有 `manifests` 中**真正声明了
+  平台**（`platform` 非空且 `os` 与 `architecture` 都非空）的条目才对应一个
   `PlatformEntry`，基础信息（`os`/`architecture`）与可选信息（`variant`、
   `os.version`、`os.features`、`features`）原样呈现。
+- **没有平台信息的附属条目不是平台**：索引里除了平台镜像，还可能挂着签名、
+  证明材料（attestation）等附属内容，它们的 `manifests` 条目不带 `platform`。
+  这类条目**不会出现在发现结果里，也不参与"全部平台"的批量准备与层数/
+  大小统计**；即使附属内容本地缺失（例如预热时尚未同步），发现与批量也不
+  受影响，因为整个流程从不读取它们的内容。
+- **声明了平台但内容残缺属于清单本身有问题**：条目带 `platform` 但缺少
+  `os` 或 `architecture`（以及摘要格式非法）时返回 `ErrPlatformBad`，
+  与"条件没筛中"严格区分——前者是清单坏了，后者是清单合法但没有想要的
+  平台。
 - 引用本身是**单个平台镜像清单**（`Kind="manifest"`）：返回**恰好一条**
   entry——其 `Platform` 为零值、`Descriptor` 指向根清单自身。单平台不是
   错误情形，调用方不需要靠错误类型去猜"这到底是不是索引"。
-- **顺序稳定可复现**：索引来源严格按 `manifests` 数组的内容定义顺序返回；
-  索引是内容寻址的不可变字节，同一摘要永远得到同一顺序（标签迁移不影响）。
-- 索引中存在摘要非法的条目：返回 `ErrPlatformBad`（清单本身有问题）；
-  根内容截断/非法 JSON、媒体类型不支持、损坏/缺失分别返回既有对应错误。
+- **顺序稳定可复现**：平台条目严格按 `manifests` 数组的内容定义顺序返回，
+  `Entry.Index` 是该条目在**原 `manifests` 数组**中的下标（附属条目被跳过
+  后下标可能不连续）；索引是内容寻址的不可变字节，同一摘要永远得到同一
+  顺序（标签迁移不影响）。
+- 根内容截断/非法 JSON、媒体类型不支持、损坏/缺失分别返回既有对应错误。
 
-### 4.2 条件筛选（PlatformSelector）
+### 4.2 条件挑选（PlatformSelector / SelectPlatform）
 
 用链式 setter 构造条件，**哪些维度被显式设置，哪些才构成约束**：
 
@@ -103,7 +114,7 @@ q := ocistore.NewPlatformSelector().
 条件语义：
 
 - **未设置（没调用对应 setter）的维度完全不参与相等判断**。只给
-  `WithOS("linux")` 时，`linux/amd64` 与 `linux/arm64/v8` 都会命中。
+  `WithOS("linux")` 时，`linux/amd64` 与 `linux/arm64/v8` 都算命中。
 - **候选在未被约束的维度上多写信息不会被排除**：没给 `variant` 时带
   `variant=v8` 的候选照样命中；特性维度采用**子集合包含**——条件要求的每
   一个特性都必须出现，但候选携带额外特性不影响命中。
@@ -111,29 +122,48 @@ q := ocistore.NewPlatformSelector().
   "未设置"不同，用于需要精确语义的调用方。
 - 空条件（`NewPlatformSelector()` 或传 `nil`）匹配全部平台。
 
-**多个命中时的择优规则（确定性，不随机）**：`SelectPlatforms` 不做二选一，
-而是按发现顺序（即索引内容定义顺序）返回**全部**命中，每项带 `Index`；
-调用方需要唯一结果时按 `Index` 取第一个即可，规则简单且可解释。
-`BatchResolve` 则取多组条件命中平台的**并集**。
+**多个命中时的择优规则（确定、讲得清楚，接口直接返回唯一一个，调用方无需
+二次选择）**：
+
+1. 先按上面的相等规则筛出全部命中；
+2. **额外特化更少者优先**：统计候选在条件未约束的维度上多写的非默认信息
+   数——非空的 `variant`、`os.version`、非空的 `os.features` 列表、非空的
+   `features` 列表各按一项计（列表非空只算一项，不按元素个数，避免长特性
+   列表获得不成比例权重）；计数最小的候选胜出。含义直观：条件只给
+   `arch=arm64` 时，裸 `arm64` 比 `arm64/v7` 更贴合"只要 arm64"的意图，
+   携带版本号与一堆特性的特化候选排在更后面；
+3. **计数相同则按发现顺序**（索引 `manifests` 内容定义顺序）取最靠前者。
+
+索引是不可变内容，条件相同则输入集合相同，规则又是纯函数，因此**同一份
+索引、同一组条件每次结果必然一致**；结果平台来自哪一项由 `Entry.Index`
+可回溯。
 
 **两类"没结果"严格分开，绝不混成一种失败**：
 
 | 情形 | 表现 |
 |---|---|
-| 清单本身有问题（根缺失/损坏、JSON 非法、媒体类型不支持、条目摘要非法） | 返回 error，可 `errors.Is` 判定 |
-| 清单合法但条件一个都没命中 | `err == nil`，命中切片为空（批量里记为 `Unmatched` 条件下标） |
+| 清单本身有问题（根缺失/损坏、JSON 非法、媒体类型不支持、条目摘要非法、平台声明残缺） | 返回 error，可 `errors.Is` 判定（残缺平台为 `ErrPlatformBad`） |
+| 清单合法但条件一个都没命中 | `err == nil` 且命中指针为 `nil`（批量里记为 `Unmatched` 条件下标） |
+
+注意：无平台附属条目在任何条件下都不可能被选中——它们根本不在候选集合中。
 
 ### 4.3 批量解析（BatchResolve / ResolveAllPlatforms）
 
-- 输入一组 `PlatformSelector`：先发现，再对每组条件取命中平台的**并集**，
-  按清单摘要**去重**（同一份子清单即使被多组条件命中也只准备一次），
-  保持发现顺序。
+- 输入一组 `PlatformSelector`：先发现（自动排除附属条目），再对**每个条件
+  各自按 4.2 的规则择优唯一一个平台**，把选中的平台取**并集**，按清单摘要
+  **去重**（多个条件择优到同一份子清单时只准备一次），最终顺序固定为
+  **发现顺序**，与条件的提交顺序无关。
+- 没有选中任何平台的条件，其下标（升序）记入 `BatchResult.Unmatched`，
+  不构成错误。不传任何条件（`selectors` 为空，即 `ResolveAllPlatforms`）
+  表示准备发现到的全部平台；若索引只有附属条目，则得到零个镜像的成功结果。
 - 每个平台独立准备：读取并校验子清单（嵌套索引按 `ErrMediaType` 拒绝）、
   校验其 config 与全部层存在且完好，并汇总 `LayerCount` 与 `TotalSize`
-  （各层 `Descriptor.Size` 之和）。
+  （各层 `Descriptor.Size` 之和）。附属条目的字节从不被读取，不计入任何
+  统计。
 - **某个平台失败不连累其它平台**：失败记录在该 `PlatformImage.Err`，
-  且失败项不暴露半成品（`Manifest`/`Layers` 为空）；成功项保证 config 与
-  每层都已通过完整性校验。批量过程全程只读，不发布任何临时内容。
+  且失败项不暴露半成品（`Manifest`/`Layers` 为空、计数与大小为 0）；
+  成功项保证 config 与每层都已通过完整性校验。批量过程全程只读，不发布
+  任何临时内容。
 - `BatchResult.Unmatched`（升序的条件下标）与 `PlatformImage.Err` 表达两类
   不同问题：前者是"条件没筛中"，后者是"筛中了但内容没准备好"。
 
@@ -141,8 +171,9 @@ q := ocistore.NewPlatformSelector().
 
 批量解析分四个阶段，保证基于一个自洽快照、且不会读到半成品：
 
-1. **发现**：先把 `ref`（标签或摘要）解析为根摘要。标签迁移/删除只改动名字
-   指针，根摘要一旦确定就不再受标签影响；内容寻址字节不可变。
+1. **发现**：先把 `ref`（标签或摘要）解析为根摘要，并在解析索引字节时一次性
+   完成附属条目排除与坏条目校验（之后不会再读取任何附属内容）。标签迁移/
+   删除只改动名字指针，根摘要一旦确定就不再受标签影响；内容寻址字节不可变。
 2. **受保护窗口内打 Pin**：在与 GC/发布互斥的窗口（`gcmu`，锁顺序与 GC
    一致为 `gcmu -> pinmu`）内确认根仍完好并把根 `Pin` 计数加一。此后：
    - GC 的引用图包含"被 Pin 的根 → 索引 → 子清单 → config/层"整条边，
@@ -154,18 +185,24 @@ q := ocistore.NewPlatformSelector().
 4. **释放 Pin**：`defer Unpin(根)`，成功与失败路径都释放，不泄漏保护计数；
    Unpin 之后内容才可按可达性被后续 GC 回收。
 
-注意：这层 API 只提供只读的"发现/筛选/准备"，不负责下载缺失内容；子清单或
+注意：这层 API 只提供只读的"发现/挑选/准备"，不负责下载缺失内容；子清单或
 层缺失时该平台返回包装了 `ErrNotExist`/`ErrCorrupted` 的错误，由上层拉取
-流程（配合既有 `Pin/Unpin` 协议）补齐。
+流程（配合既有 `Pin/Unpin` 协议）补齐。无平台附属条目从发现起就被排除，
+其内容缺失既不报错，也不需要补齐即可完成全部平台的预热。
 
 ### 4.5 兼容范围
 
 - 与 `FetchPlatform` 使用同一套清单解析与校验逻辑：OCI/Docker v2 媒体类型、
   无 `mediaType` 时的结构嗅探、额外字段保留、严格 JSON、嵌套索引拒绝，
-  行为完全一致，原有单平台解析不受影响。
-- 单平台镜像清单在三个 API 中都有统一表示（`Kind="manifest"` + 一条 entry）；
-  对单平台清单使用非空条件时，因其平台为零值，仅空条件（匹配全部）能命中，
-  非空条件零命中——这与"未设置的维度不参与比较"的规则一致。
+  行为完全一致，**原有单平台解析（`FetchPlatform`）不受影响**：它仍按
+  `os/architecture/variant` 严格相等选择，且仍会遍历索引的全部条目——
+  附属条目排除与确定性择优只作用于第 4 节这组发现/批量 API。
+- 单平台镜像清单在三个 API 中都有统一表示（`Kind="manifest"` + 一条 entry），
+  其"恰好一个明确结果"的表现保持不变；对单平台清单使用非空条件时，因其
+  平台为零值，仅空条件（匹配全部）能选中，非空条件零命中（`nil` + `nil`）
+  ——这与"未设置的维度不参与比较"的规则一致。
+- 索引中无平台附属条目的排除是纯发现层行为：不修改任何 blob，也不影响
+  GC 可达性（附属内容仅被索引引用时，其存废照常由标签/GC 规则决定）。
 
 ## 5. 标签语义
 
@@ -216,5 +253,26 @@ q := ocistore.NewPlatformSelector().
 - 同内容并发 `PutBlob` 通过内部 singleflight 合并为一次落盘，其余调用共享结果。
 - `mu` 保护配额/发布一致性，`gcmu` 串行化 GC 与发布、标签变更，`pinmu` 保护 Pin 计数。
 - 测试在 `-race` 下覆盖：同内容并发写、迁移期间并发读、共享层多清单并发写、
-  30 轮"并发拉取 vs 删标签 + GC"竞态，以及多平台批量解析与标签迁移/删除/
-  GC 的真并发竞态（悬空引用、半成品、保护泄漏均被断言）。
+  30 轮"并发拉取 vs 删标签 + GC"竞态，以及多平台批量解析（"全部平台"与
+  "部分条件择优"两种调用）与标签迁移/删除/GC 的真并发竞态（悬空引用、
+  半成品、保护泄漏均被断言）。
+
+## 9. 本地验证
+
+```bash
+go test ./... -v          # 全量单测；关键用例打印输入 / 判定依据 / 最终状态
+go test -race ./...       # 竞态检测
+go test -race -count=10 ./...  # 重复执行稳定复现/排除竞态
+go vet ./...              # 静态检查
+```
+
+与本次行为相关的重点用例（见 `discover_batch_test.go`）：
+
+| 用例 | 覆盖行为 |
+|---|---|
+| `TestDiscoverIndex` / `TestDiscoverAttachedEntriesIgnored` / `TestDiscoverAttachedBlobAbsent` | 无平台附属条目排除、原数组下标保留、附属内容缺失不影响发现/批量 |
+| `TestDiscoverBadEntryDistinctFromNoMatch` | 摘要非法、平台声明残缺 → `ErrPlatformBad`；条件没筛中 → `nil`+`nil`，两类不混淆 |
+| `TestSelectPartialConditions` / `TestSelectTieBreakDeterministic` / `TestSelectSingleManifest` | 部分条件语义、确定性择优（特化更少→索引顺序）、20 次重复结果恒定、单平台表现不变 |
+| `TestResolveAllPlatformsBatch` / `TestBatchSelectorsDedupAndUnmatched` | 全部平台与统计不含附属条目；每条件择优一个、并集去重、按发现顺序、`Unmatched` 分类 |
+| `TestBatchPartialPlatformFailure` | 单平台损坏只失败该项，其它平台成功，失败项无半成品 |
+| `TestBatchConcurrentTagMigrateAndGC` / `TestBatchPinnedContentNotCollected` | 批量（全部+条件）与标签迁移/删除/GC 真并发下结果自洽、无悬空引用、Pin 不泄漏 |

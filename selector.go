@@ -2,7 +2,7 @@ package ocistore
 
 import "context"
 
-// PlatformMatch 是一次条件筛选命中的候选平台。
+// PlatformMatch 是一次条件挑选选中的平台。
 type PlatformMatch struct {
 	Entry PlatformEntry
 }
@@ -61,12 +61,6 @@ func (q *PlatformSelector) WithFeatures(feats ...string) *PlatformSelector {
 	return q
 }
 
-// empty 报告条件是否不含任何约束。
-func (q *PlatformSelector) empty() bool {
-	return q == nil || (q.os == nil && q.architecture == nil && q.variant == nil &&
-		q.osVersion == nil && len(q.osFeatures) == 0 && len(q.features) == 0)
-}
-
 // match 判断单个候选是否满足条件：只比较被设置的维度，其余维度不参与判断。
 func (q *PlatformSelector) match(p Platform) bool {
 	if q == nil {
@@ -107,34 +101,79 @@ func containsAll(have, want []string) bool {
 	return true
 }
 
-// SelectPlatforms 按部分条件在引用中挑选平台。
+// SelectPlatform 按部分条件在引用中挑选唯一一个最合适的平台。
 //
 // 返回值约定（两种"没结果"严格分开）：
 //
 //   - 发现/解析失败（引用不存在、根内容损坏、JSON 非法、媒体类型不支持、
-//     索引条目摘要非法）：返回错误，调用方可用 errors.Is 判定具体原因；
-//   - 清单本身合法但条件一个都没命中：返回 err == nil 且 matches 为空切片，
-//     这不是错误，调用方据此区分"清单有问题"与"条件没匹配上"。
+//     索引条目摘要非法或平台声明残缺）：返回 error，调用方可用 errors.Is
+//     判定具体原因；
+//   - 清单本身合法但条件一个都没命中：返回 err == nil 且 match == nil，
+//     这不是错误，调用方据此区分"清单有问题"与"条件没匹配上"；
+//   - 命中一个或多个：返回 err == nil 且 match 非 nil，永远是同一个结果，
+//     调用方不需要再做二次选择。
 //
-// 命中多个时的择优规则：本方法不做随机二选一，而是按发现顺序（即索引
-// manifests 的内容定义顺序）返回全部命中，由调用方按 Index 自行取舍；
-// 批量解析时取这些命中的并集，顺序因此确定且可解释。
-func (s *Store) SelectPlatforms(ctx context.Context, ref string, q *PlatformSelector) (*DiscoveryResult, []PlatformMatch, error) {
+// 择优规则（确定、可解释，同一份索引同一组条件结果恒定）：
+//
+//  1. 先按条件相等判断筛出全部命中（未设置的维度不参与比较，见 match）；
+//  2. 在命中集合中，优先选择"额外特化更少"的候选：统计候选在条件未约束的
+//     维度上多写的非默认信息数（variant、os.version、os.features、features
+//     各按一项计），计数最小者胜——即条件只给 arch=arm64 时，裸 arm64 比
+//     arm64/v7 更合适；条件没约束任何维度时，该计数对所有候选都生效；
+//  3. 计数相同则按发现顺序（即索引 manifests 内容定义顺序）取最靠前者。
+//
+// 单平台镜像清单（Kind=KindManifest）：空条件选中唯一条目；非空条件因其
+// 平台为零值而零命中（match == nil），与索引上的规则完全一致。
+func (s *Store) SelectPlatform(ctx context.Context, ref string, q *PlatformSelector) (*DiscoveryResult, *PlatformMatch, error) {
 	disc, err := s.DiscoverPlatforms(ctx, ref)
 	if err != nil {
 		return nil, nil, err
 	}
-	matches := make([]PlatformMatch, 0)
-	if q.empty() {
-		for _, e := range disc.Entries {
-			matches = append(matches, PlatformMatch{Entry: e})
-		}
-		return disc, matches, nil
+	best := selectBest(disc.Entries, q)
+	if best == nil {
+		return disc, nil, nil
 	}
-	for _, e := range disc.Entries {
-		if q.match(e.Platform) {
-			matches = append(matches, PlatformMatch{Entry: e})
+	return disc, &PlatformMatch{Entry: *best}, nil
+}
+
+// selectBest 按 SelectPlatform 的择优规则从候选中选出唯一一个；零命中返回 nil。
+func selectBest(entries []PlatformEntry, q *PlatformSelector) *PlatformEntry {
+	var best *PlatformEntry
+	bestExtra := 0
+	for i := range entries {
+		e := &entries[i]
+		if !q.match(e.Platform) {
+			continue
+		}
+		extra := extraSpecializations(e.Platform, q)
+		if best == nil || extra < bestExtra {
+			best = e
+			bestExtra = extra
+			// 计数相同不替换：entries 为发现顺序，天然保留"最靠前"。
 		}
 	}
-	return disc, matches, nil
+	return best
+}
+
+// extraSpecializations 统计候选在条件未约束维度上多写的非默认特化信息数：
+// variant / os.version / 特性列表四类各按一项计（列表非空即一项，不按元素数，
+// 避免长特性列表在择优中获得不成比例的权重）。
+func extraSpecializations(p Platform, q *PlatformSelector) int {
+	if q == nil {
+		q = NewPlatformSelector() // nil 条件 = 无约束：所有维度都计为额外特化
+	}
+	n := 0
+	if q.variant == nil && p.Variant != "" {
+		n++
+	}
+	if q.osVersion == nil && p.OSVersion != "" {
+		n++
+	}
+	if len(q.osFeatures) == 0 && len(p.OSFeatures) > 0 {
+		n++
+	}
+	if len(q.features) == 0 && len(p.Features) > 0 {
+		n++
+	}
+	return n
 }

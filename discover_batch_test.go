@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
@@ -15,23 +16,33 @@ type richArtifacts struct {
 	indexD Digest
 	plats  map[string]testArtifacts
 	order  []string // 索引中平台的内容定义顺序
+	// attestations: 挂在索引上的无平台附属条目（签名/证明材料），
+	// key 为用途说明，value 为内容摘要；它们不是平台，不应混入平台列表与统计。
+	attestations map[string]Digest
 }
 
 // buildRichIndex 构造 linux/amd64、linux/arm64/v8（带 osVersion/osFeatures/features）、
-// linux/arm64/v7 三个平台的索引并打标签。
+// linux/arm64/v7 三个平台的索引并打标签。索引里额外挂两个没有 platform 信息的
+// 附属条目（签名、证明材料），用于验证发现/批量只覆盖真正声明平台的条目。
 func buildRichIndex(t *testing.T, s *Store, tag string) richArtifacts {
 	t.Helper()
 	amd := buildManifest(t, s, "amd64")
 	armv8 := buildManifest(t, s, "arm64-v8")
 	armv7 := buildManifest(t, s, "arm64-v7")
+	sig := putBytes(t, s, []byte("fake-signature-payload"))
+	att := putBytes(t, s, []byte("fake-attestation-payload"))
 	descs := []Descriptor{
 		{MediaType: MediaTypeOCIManifest, Digest: amd.manifestD, Size: int64(len(amd.manifest)),
 			Platform: &Platform{Architecture: "amd64", OS: "linux"}},
 		{MediaType: MediaTypeOCIManifest, Digest: armv8.manifestD, Size: int64(len(armv8.manifest)),
 			Platform: &Platform{Architecture: "arm64", OS: "linux", Variant: "v8",
 				OSVersion: "8.0", OSFeatures: []string{"foo", "bar"}, Features: []string{"custom"}}},
+		// 附属条目 1：签名，没有 platform
+		{MediaType: "application/vnd.oci.image.signature.v1+json", Digest: sig, Size: 24},
 		{MediaType: MediaTypeOCIManifest, Digest: armv7.manifestD, Size: int64(len(armv7.manifest)),
 			Platform: &Platform{Architecture: "arm64", OS: "linux", Variant: "v7"}},
+		// 附属条目 2：证明材料，没有 platform
+		{MediaType: "application/vnd.oci.image.attestation.v1+json", Digest: att, Size: 26},
 	}
 	idx := &ImageIndex{SchemaVersion: 2, MediaType: MediaTypeOCIIndex, Manifests: descs}
 	raw, err := json.Marshal(idx)
@@ -45,29 +56,43 @@ func buildRichIndex(t *testing.T, s *Store, tag string) richArtifacts {
 		}
 	}
 	return richArtifacts{indexD: idxD, order: []string{"amd64", "v8", "v7"},
-		plats: map[string]testArtifacts{"amd64": amd, "v8": armv8, "v7": armv7}}
+		plats:        map[string]testArtifacts{"amd64": amd, "v8": armv8, "v7": armv7},
+		attestations: map[string]Digest{"signature": sig, "attestation": att}}
 }
 
-// TestDiscoverIndex：发现多架构索引，字段完整、顺序与索引内容定义一致、可复现。
+// TestDiscoverIndex：发现多架构索引，字段完整、顺序与索引内容定义一致、可复现；
+// 无平台信息的附属条目（签名/证明材料）不出现在平台列表里。
 func TestDiscoverIndex(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(Options{RootDir: dir})
 	defer s.Close()
 	rich := buildRichIndex(t, s, "multi:v1")
-	t.Logf("input: tag multi:v1 -> index %s with %d entries in order %v",
-		rich.indexD, len(rich.order), rich.order)
+	t.Logf("input: tag multi:v1 -> index %s with 5 manifests entries (3 platforms + signature %s + attestation %s)",
+		rich.indexD, rich.attestations["signature"], rich.attestations["attestation"])
 
 	disc, err := s.DiscoverPlatforms(context.Background(), "multi:v1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if disc.Kind != KindIndex || disc.Root != rich.indexD || len(disc.Entries) != 3 {
-		t.Fatalf("judgement basis: want 3 index entries, got kind=%s root=%s n=%d",
+		t.Fatalf("judgement basis: want 3 platform entries (attached non-platform entries excluded), got kind=%s root=%s n=%d",
 			disc.Kind, disc.Root, len(disc.Entries))
 	}
-	// 顺序必须是内容定义顺序，且稳定可复现
-	gotOrder := []string{}
+	// 附属条目摘要不得出现在发现结果中
 	for _, e := range disc.Entries {
+		if e.Descriptor.Digest == rich.attestations["signature"] ||
+			e.Descriptor.Digest == rich.attestations["attestation"] {
+			t.Fatalf("attached non-platform entry leaked into platforms: %+v", e)
+		}
+	}
+	// 顺序必须是内容定义顺序，且稳定可复现；Index 保留在原 manifests 数组中的下标
+	// （附属条目被跳过后下标不连续：v7 在数组中是下标 3）
+	gotOrder := []string{}
+	wantIndex := []int{0, 1, 3}
+	for i, e := range disc.Entries {
+		if e.Index != wantIndex[i] {
+			t.Fatalf("entry %d original index = %d, want %d", i, e.Index, wantIndex[i])
+		}
 		switch {
 		case e.Platform.Architecture == "amd64":
 			gotOrder = append(gotOrder, "amd64")
@@ -92,8 +117,8 @@ func TestDiscoverIndex(t *testing.T) {
 	if v8.Descriptor.Digest != rich.plats["v8"].manifestD {
 		t.Fatalf("entry descriptor digest mismatch")
 	}
-	t.Logf("final state: discovered %d platforms in stable order %v; optional fields on v8 preserved",
-		len(disc.Entries), gotOrder)
+	t.Logf("final state: discovered 3 of 5 entries in stable order %v (original indexes %v); attached entries excluded; optional fields on v8 preserved",
+		gotOrder, wantIndex)
 }
 
 // TestDiscoverSingleManifest：引用指向单平台镜像时给出统一结果，而不是模糊错误。
@@ -123,8 +148,8 @@ func TestDiscoverSingleManifest(t *testing.T) {
 		e.Descriptor.Digest)
 }
 
-// TestDiscoverBadEntryDistinctFromNoMatch：索引条目摘要非法属于清单问题，
-// 必须与"条件没筛中"分开。
+// TestDiscoverBadEntryDistinctFromNoMatch：索引条目摘要非法、或声明了平台但
+// os/architecture 残缺，都属于清单问题，必须与"条件没筛中"分开。
 func TestDiscoverBadEntryDistinctFromNoMatch(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(Options{RootDir: dir})
@@ -139,102 +164,293 @@ func TestDiscoverBadEntryDistinctFromNoMatch(t *testing.T) {
 	if _, err := s.DiscoverPlatforms(context.Background(), idxD.String()); !errors.Is(err, ErrPlatformBad) {
 		t.Fatalf("want ErrPlatformBad for malformed index entry, got %v", err)
 	}
-	t.Logf("judgement basis: malformed index rejected with ErrPlatformBad (distinct from no-match)")
+	t.Logf("judgement basis: invalid digest rejected with ErrPlatformBad (distinct from no-match)")
+
+	// 声明了 platform 但缺少 architecture：清单本身有问题，不是"没筛中"
+	missingArch := []byte(`{"schemaVersion":2,"mediaType":"` + MediaTypeOCIIndex + `","manifests":[` +
+		`{"mediaType":"` + MediaTypeOCIManifest + `","digest":"sha256:` + repeat64("a") + `","size":1,` +
+		`"platform":{"os":"linux"}}]}`)
+	missingArchD := putBytes(t, s, missingArch)
+	if _, err := s.DiscoverPlatforms(context.Background(), missingArchD.String()); !errors.Is(err, ErrPlatformBad) {
+		t.Fatalf("want ErrPlatformBad for platform missing architecture, got %v", err)
+	}
+	t.Logf("judgement basis: platform declared without architecture rejected with ErrPlatformBad")
+
+	// 声明了 platform 但缺少 os，同理
+	missingOS := []byte(`{"schemaVersion":2,"mediaType":"` + MediaTypeOCIIndex + `","manifests":[` +
+		`{"mediaType":"` + MediaTypeOCIManifest + `","digest":"sha256:` + repeat64("b") + `","size":1,` +
+		`"platform":{"architecture":"amd64"}}]}`)
+	missingOSD := putBytes(t, s, missingOS)
+	if _, err := s.DiscoverPlatforms(context.Background(), missingOSD.String()); !errors.Is(err, ErrPlatformBad) {
+		t.Fatalf("want ErrPlatformBad for platform missing os, got %v", err)
+	}
+	t.Logf("judgement basis: platform declared without os rejected with ErrPlatformBad")
+
+	// 对照：同样是"拿不到想要的平台"，没有 platform 的附属条目只是被排除，
+	// 条件没筛中时 SelectPlatform 返回 nil + nil，而不是 ErrPlatformBad。
+	rich := buildRichIndex(t, s, "rich")
+	t.Logf("control: index %s has 5 manifests entries (3 platforms + 2 attached), selector os=windows",
+		rich.indexD)
+	disc, m, err := s.SelectPlatform(context.Background(), "rich",
+		NewPlatformSelector().WithOS("windows"))
+	if err != nil || m != nil {
+		t.Fatalf("no-match must be nil match + nil err, got m=%+v err=%v", m, err)
+	}
+	if len(disc.Entries) != 3 {
+		t.Fatalf("control index must still discover its 3 real platforms, got %d", len(disc.Entries))
+	}
+	t.Logf("final state: bad listing -> ErrPlatformBad; valid listing with no hit -> nil+nil, never conflated")
 }
 
-// TestSelectPartialConditions：只给部分条件时，未给维度不参与比较，候选多写信息不被排除。
+// TestDiscoverAttachedEntriesIgnored：只有附属条目、没有任何真正平台的索引，
+// 发现结果是零个平台的合法 KindIndex，而不是错误或空白平台。
+func TestDiscoverAttachedEntriesIgnored(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(Options{RootDir: dir})
+	defer s.Close()
+
+	sig := putBytes(t, s, []byte("signature-only"))
+	idx := &ImageIndex{SchemaVersion: 2, MediaType: MediaTypeOCIIndex, Manifests: []Descriptor{
+		{MediaType: "application/vnd.oci.image.signature.v1+json", Digest: sig, Size: int64(len("signature-only"))},
+	}}
+	raw, _ := json.Marshal(idx)
+	idxD := putBytes(t, s, raw)
+	_ = s.PutTag(context.Background(), "artifacts-only", idxD)
+	t.Logf("input: index %s has one manifests entry without platform (signature %s)", idxD, sig)
+
+	disc, err := s.DiscoverPlatforms(context.Background(), "artifacts-only")
+	if err != nil {
+		t.Fatalf("attached-only index must not be an error: %v", err)
+	}
+	if disc.Kind != KindIndex || len(disc.Entries) != 0 {
+		t.Fatalf("want zero platforms for attached-only index, got %+v", disc)
+	}
+	// 全部平台批量准备：零个镜像，附属内容不参与，也不算 Unmatched
+	res, err := s.ResolveAllPlatforms(context.Background(), "artifacts-only")
+	if err != nil || len(res.Images) != 0 {
+		t.Fatalf("resolve-all on attached-only index: images=%d err=%v, want 0/nil", len(res.Images), err)
+	}
+	t.Logf("final state: attached-only index -> 0 platforms, 0 prepared images, no error")
+}
+
+// TestDiscoverAttachedBlobAbsent：索引里挂着无平台附属条目，但其内容本地不存在
+// （如预热时签名/证明材料尚未同步）。发现与批量准备都不应触碰附属内容，
+// 三个真正平台必须照常成功，统计也不包含附属字节。
+func TestDiscoverAttachedBlobAbsent(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(Options{RootDir: dir})
+	defer s.Close()
+	ctx := context.Background()
+	rich := buildRichIndex(t, s, "multi:v1")
+
+	// 删除两个附属条目的 blob（保留索引与全部平台内容）
+	for name, d := range rich.attestations {
+		if err := os.Remove(blobPath(dir, d)); err != nil {
+			t.Fatalf("remove attached blob %s (%s): %v", name, d, err)
+		}
+	}
+	t.Logf("input: index %s intact, but attached blobs %v deleted locally (not yet synced)",
+		rich.indexD, rich.attestations)
+
+	disc, err := s.DiscoverPlatforms(ctx, "multi:v1")
+	if err != nil {
+		t.Fatalf("discovery must not read attached blobs: %v", err)
+	}
+	if len(disc.Entries) != 3 {
+		t.Fatalf("judgement basis: want 3 platforms despite missing attached blobs, got %d", len(disc.Entries))
+	}
+	res, err := s.ResolveAllPlatforms(ctx, "multi:v1")
+	if err != nil || len(res.Images) != 3 {
+		t.Fatalf("resolve-all must ignore absent attached blobs: images=%d err=%v", len(res.Images), err)
+	}
+	for _, img := range res.Images {
+		if img.Err != nil {
+			t.Fatalf("real platform %s must be ready while attached blobs absent: %v", img.Entry.Platform, img.Err)
+		}
+	}
+	t.Logf("final state: 3 platforms discovered and prepared with attached blobs absent; attached bytes never read")
+}
+
+// TestSelectPartialConditions：只给部分条件时，未给维度不参与比较，候选多写信息不被排除；
+// SelectPlatform 直接返回唯一一个最合适的平台；没筛中是 nil+nil 而不是错误。
 func TestSelectPartialConditions(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(Options{RootDir: dir})
 	defer s.Close()
 	rich := buildRichIndex(t, s, "multi:v1")
 	ctx := context.Background()
-	t.Logf("input: index %s entries=[linux/amd64, linux/arm64/v8{osVer=8.0 os.features=[foo,bar] features=[custom]}, linux/arm64/v7]",
+	t.Logf("input: index %s platforms=[linux/amd64, linux/arm64/v8{osVer=8.0 os.features=[foo,bar] features=[custom]}, linux/arm64/v7] + 2 attached entries",
 		rich.indexD)
 
-	// 只给 OS：三个 linux 全部命中（v8 多写的 variant/osVersion/features 不构成排除理由）
-	_, ms, err := s.SelectPlatforms(ctx, "multi:v1", NewPlatformSelector().WithOS("linux"))
-	if err != nil || len(ms) != 3 {
-		t.Fatalf("OS-only filter: n=%d err=%v, want 3", len(ms), err)
+	pick := func(q *PlatformSelector, what string) *PlatformMatch {
+		disc, m, err := s.SelectPlatform(ctx, "multi:v1", q)
+		if err != nil {
+			t.Fatalf("%s: unexpected error %v", what, err)
+		}
+		if disc == nil {
+			t.Fatalf("%s: discovery result must always be returned", what)
+		}
+		if m == nil {
+			t.Fatalf("%s: expected one platform, got nil", what)
+		}
+		return m
 	}
-	// 只给架构：v8 与 v7 都命中，顺序为内容定义顺序 v8 在前
-	_, ms, _ = s.SelectPlatforms(ctx, "multi:v1", NewPlatformSelector().WithArchitecture("arm64"))
-	if len(ms) != 2 || ms[0].Entry.Platform.Variant != "v8" || ms[1].Entry.Platform.Variant != "v7" {
-		t.Fatalf("arch-only filter should hit v8,v7 in index order, got %+v", ms)
+
+	// 只给 OS：三个 linux 命中，amd64 额外特化计数 0（无 variant/osVersion/features），
+	// v8 计数 3，v7 计数 1 -> 直接选 amd64，调用方无需二次选择
+	m := pick(NewPlatformSelector().WithOS("linux"), "OS-only filter")
+	if m.Entry.Platform.Architecture != "amd64" {
+		t.Fatalf("OS-only should prefer least-specialized amd64, got %s", m.Entry.Platform)
+	}
+	// 只给架构：v8 与 v7 都命中；v8 还携带 variant+osVersion+两类特性（额外特化 4），
+	// v7 只多一个 variant（额外特化 1）-> 额外特化更少的 v7 胜出
+	m = pick(NewPlatformSelector().WithArchitecture("arm64"), "arch-only filter")
+	if m.Entry.Platform.Variant != "v7" {
+		t.Fatalf("arch-only should prefer less-specialized v7 over feature-rich v8, got %s", m.Entry.Platform)
 	}
 	// 系统+架构+变体：精确命中 v7
-	_, ms, _ = s.SelectPlatforms(ctx, "multi:v1",
-		NewPlatformSelector().WithOS("linux").WithArchitecture("arm64").WithVariant("v7"))
-	if len(ms) != 1 || ms[0].Entry.Platform.Variant != "v7" {
-		t.Fatalf("full-condition filter should hit only v7, got %+v", ms)
+	m = pick(NewPlatformSelector().WithOS("linux").WithArchitecture("arm64").WithVariant("v7"),
+		"full-condition filter")
+	if m.Entry.Platform.Variant != "v7" {
+		t.Fatalf("full-condition filter should hit v7, got %s", m.Entry.Platform)
 	}
 	// 显式要求 variant 为空：只命中 amd64，v8 不回退
-	_, ms, _ = s.SelectPlatforms(ctx, "multi:v1",
-		NewPlatformSelector().WithArchitecture("amd64").WithVariant(""))
-	if len(ms) != 1 || ms[0].Entry.Platform.Architecture != "amd64" {
-		t.Fatalf("empty-variant constraint should hit only amd64, got %+v", ms)
+	m = pick(NewPlatformSelector().WithArchitecture("amd64").WithVariant(""), "empty-variant constraint")
+	if m.Entry.Platform.Architecture != "amd64" {
+		t.Fatalf("empty-variant constraint should hit amd64, got %s", m.Entry.Platform)
 	}
-	// 系统版本约束
-	_, ms, _ = s.SelectPlatforms(ctx, "multi:v1", NewPlatformSelector().WithOSVersion("8.0"))
-	if len(ms) != 1 || ms[0].Entry.Platform.Variant != "v8" {
-		t.Fatalf("osVersion filter should hit only v8, got %+v", ms)
+	// 系统版本约束：唯一命中 v8
+	m = pick(NewPlatformSelector().WithOSVersion("8.0"), "osVersion filter")
+	if m.Entry.Platform.Variant != "v8" {
+		t.Fatalf("osVersion filter should hit v8, got %s", m.Entry.Platform)
 	}
 	// 特性子集合：要求 foo 时，携带 [foo,bar] 的 v8 命中（额外特性不排除）
-	_, ms, _ = s.SelectPlatforms(ctx, "multi:v1", NewPlatformSelector().WithOSFeatures("foo"))
-	if len(ms) != 1 || ms[0].Entry.Platform.Variant != "v8" {
-		t.Fatalf("os.features subset filter should hit v8, got %+v", ms)
-	}
-	// 要求候选没有的特性：零命中但不是错误
-	_, ms, err = s.SelectPlatforms(ctx, "multi:v1", NewPlatformSelector().WithOSFeatures("missing"))
-	if err != nil || len(ms) != 0 {
-		t.Fatalf("missing feature: want empty matches + nil err, got n=%d err=%v", len(ms), err)
+	m = pick(NewPlatformSelector().WithOSFeatures("foo"), "os.features subset filter")
+	if m.Entry.Platform.Variant != "v8" {
+		t.Fatalf("os.features subset filter should hit v8, got %s", m.Entry.Platform)
 	}
 	// 附加特性 features 维度同理
-	_, ms, _ = s.SelectPlatforms(ctx, "multi:v1", NewPlatformSelector().WithFeatures("custom"))
-	if len(ms) != 1 || ms[0].Entry.Platform.Variant != "v8" {
-		t.Fatalf("features subset filter should hit v8, got %+v", ms)
+	m = pick(NewPlatformSelector().WithFeatures("custom"), "features subset filter")
+	if m.Entry.Platform.Variant != "v8" {
+		t.Fatalf("features subset filter should hit v8, got %s", m.Entry.Platform)
 	}
-	t.Logf("final state: partial conditions judged only on set dimensions; extras never excluded; no-match is empty+nil")
+	// 要求候选没有的特性：零命中 = nil match + nil err（不是错误，也不返回附属条目）
+	_, m, err := s.SelectPlatform(ctx, "multi:v1", NewPlatformSelector().WithOSFeatures("missing"))
+	if err != nil || m != nil {
+		t.Fatalf("missing feature: want nil match + nil err, got m=%+v err=%v", m, err)
+	}
+	// 附属条目没有平台，不可能被任何条件选中
+	_, m, err = s.SelectPlatform(ctx, "multi:v1", NewPlatformSelector())
+	if err != nil || m == nil {
+		t.Fatalf("empty selector: want one best platform, got m=%v err=%v", m, err)
+	}
+	if m.Entry.Descriptor.Digest == rich.attestations["signature"] ||
+		m.Entry.Descriptor.Digest == rich.attestations["attestation"] {
+		t.Fatalf("attached non-platform entry must never be selected")
+	}
+	t.Logf("final state: partial conditions judged only on set dimensions; one best platform returned directly; no-match is nil+nil; attached entries never selectable")
 }
 
-// TestSelectMultiHitDeterministic：多个命中时按内容定义顺序全部返回，不随机二选一。
-func TestSelectMultiHitDeterministic(t *testing.T) {
+// TestSelectTieBreakDeterministic：多个命中时择优规则确定可解释——
+// 额外特化更少者优先，相同则按索引内容定义顺序；同一索引同一条件反复选择结果恒定。
+func TestSelectTieBreakDeterministic(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(Options{RootDir: dir})
 	defer s.Close()
-	rich := buildRichIndex(t, s, "multi:v1")
 
-	_, ms, err := s.SelectPlatforms(context.Background(), "multi:v1", NewPlatformSelector())
-	if err != nil || len(ms) != 3 {
-		t.Fatalf("empty selector must match all, n=%d err=%v", len(ms), err)
+	// 专门构造顺序敏感的索引：[arm64/v7, arm64/v8, arm64(裸)]，
+	// 三个候选对 arch=arm64 都命中；裸 arm64 无 variant（额外特化更少）必须胜出。
+	v7 := buildManifest(t, s, "tie-arm64-v7")
+	v8 := buildManifest(t, s, "tie-arm64-v8")
+	bare := buildManifest(t, s, "tie-arm64-bare")
+	descs := []Descriptor{
+		{MediaType: MediaTypeOCIManifest, Digest: v7.manifestD, Size: int64(len(v7.manifest)),
+			Platform: &Platform{Architecture: "arm64", OS: "linux", Variant: "v7"}},
+		{MediaType: MediaTypeOCIManifest, Digest: v8.manifestD, Size: int64(len(v8.manifest)),
+			Platform: &Platform{Architecture: "arm64", OS: "linux", Variant: "v8"}},
+		{MediaType: MediaTypeOCIManifest, Digest: bare.manifestD, Size: int64(len(bare.manifest)),
+			Platform: &Platform{Architecture: "arm64", OS: "linux"}},
 	}
-	wantDigests := []Digest{
-		rich.plats["amd64"].manifestD, rich.plats["v8"].manifestD, rich.plats["v7"].manifestD,
+	idx := &ImageIndex{SchemaVersion: 2, MediaType: MediaTypeOCIIndex, Manifests: descs}
+	raw, _ := json.Marshal(idx)
+	idxD := putBytes(t, s, raw)
+	_ = s.PutTag(context.Background(), "tie", idxD)
+	t.Logf("input: index %s order=[arm64/v7@0, arm64/v8@1, arm64/bare@2]; selector arch=arm64", idxD)
+
+	// 规则 1：额外特化更少优先——即便裸 arm64 在数组最后，也选它而不是 v7/v8
+	_, m, err := s.SelectPlatform(context.Background(), "tie", NewPlatformSelector().WithArchitecture("arm64"))
+	if err != nil || m == nil {
+		t.Fatalf("judgement basis: want one winner, got m=%v err=%v", m, err)
 	}
-	for i, m := range ms {
-		if m.Entry.Index != i || m.Entry.Descriptor.Digest != wantDigests[i] {
-			t.Fatalf("judgement basis: match order not deterministic at %d: %+v", i, m)
+	if m.Entry.Descriptor.Digest != bare.manifestD {
+		t.Fatalf("least-specialized bare arm64 must win regardless of index position, got %s", m.Entry.Platform)
+	}
+	t.Logf("judgement basis: v7 extra=1, v8 extra=1, bare extra=0 -> winner=bare@%d", m.Entry.Index)
+
+	// 规则 2：特化计数相同（v7、v8 各 1）按索引顺序取最靠前；用裸候选不存在的索引验证
+	idx2 := &ImageIndex{SchemaVersion: 2, MediaType: MediaTypeOCIIndex, Manifests: descs[:2]}
+	raw2, _ := json.Marshal(idx2)
+	idx2D := putBytes(t, s, raw2)
+	_, m2, err := s.SelectPlatform(context.Background(), idx2D.String(), NewPlatformSelector().WithArchitecture("arm64"))
+	if err != nil || m2.Entry.Descriptor.Digest != v7.manifestD {
+		t.Fatalf("equal specialization must resolve in index order -> v7, got %+v err=%v", m2, err)
+	}
+	t.Logf("judgement basis: v7@0 and v8@1 tied at extra=1 -> first in index order wins (v7)")
+
+	// 同一索引同一条件反复选择，结果必须恒定
+	for i := 0; i < 20; i++ {
+		_, rep, err := s.SelectPlatform(context.Background(), "tie", NewPlatformSelector().WithArchitecture("arm64"))
+		if err != nil || rep.Entry.Descriptor.Digest != bare.manifestD {
+			t.Fatalf("selection not deterministic at iteration %d: %+v %v", i, rep, err)
 		}
 	}
-	t.Logf("final state: %d hits returned in index order %v", len(ms), wantDigests)
+	t.Logf("final state: tie-break is deterministic (less-specialized wins, then index order); 20 repeated picks identical")
 }
 
-// TestResolveAllPlatformsBatch：批量准备全部平台，汇总层数与总大小。
+// TestSelectSingleManifest：引用本身是单平台镜像时，空条件选中唯一明确结果，
+// 表现不因本次修改而变含糊；非空条件零命中（nil+nil）。
+func TestSelectSingleManifest(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(Options{RootDir: dir})
+	defer s.Close()
+	a := buildManifest(t, s, "amd64")
+	_ = s.PutTag(context.Background(), "img", a.manifestD)
+	t.Logf("input: tag img -> single manifest %s (not an index)", a.manifestD)
+
+	disc, m, err := s.SelectPlatform(context.Background(), "img", NewPlatformSelector())
+	if err != nil {
+		t.Fatalf("single manifest must not be an error: %v", err)
+	}
+	if disc.Kind != KindManifest || m == nil || m.Entry.Descriptor.Digest != a.manifestD {
+		t.Fatalf("single manifest must yield one unambiguous match, got kind=%s m=%+v", disc.Kind, m)
+	}
+	// 非空条件：零值平台无法满足显式约束 -> nil + nil，而不是错误
+	_, m2, err := s.SelectPlatform(context.Background(), "img", NewPlatformSelector().WithOS("linux"))
+	if err != nil || m2 != nil {
+		t.Fatalf("non-empty selector on single manifest: want nil+nil, got %+v %v", m2, err)
+	}
+	t.Logf("final state: single manifest keeps one unambiguous result; constrained selector yields nil+nil")
+}
+
+// TestResolveAllPlatformsBatch：批量准备全部平台，汇总层数与总大小；
+// 无平台附属条目不参与准备，层数与总大小里不混入它们的数据。
 func TestResolveAllPlatformsBatch(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(Options{RootDir: dir})
 	defer s.Close()
 	rich := buildRichIndex(t, s, "multi:v1")
-	t.Logf("input: resolve all platforms of index %s", rich.indexD)
+	t.Logf("input: resolve all platforms of index %s (5 manifests entries, only 3 declare platforms)",
+		rich.indexD)
 
 	res, err := s.ResolveAllPlatforms(context.Background(), "multi:v1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Kind != KindIndex || len(res.Images) != 3 || len(res.Unmatched) != 0 {
-		t.Fatalf("judgement basis: want 3 images, got %+v", res)
+		t.Fatalf("judgement basis: want exactly 3 platform images (attached entries excluded), got %+v", res)
 	}
 	sizeByVariant := map[string]int64{}
+	var totalSize int64
 	for _, img := range res.Images {
 		if img.Err != nil {
 			t.Fatalf("platform %s unexpectedly failed: %v", img.Entry.Platform, img.Err)
@@ -242,8 +458,13 @@ func TestResolveAllPlatformsBatch(t *testing.T) {
 		if img.LayerCount != 1 {
 			t.Fatalf("platform %s layer count = %d, want 1", img.Entry.Platform, img.LayerCount)
 		}
+		if img.ManifestDescriptor.Digest == rich.attestations["signature"] ||
+			img.ManifestDescriptor.Digest == rich.attestations["attestation"] {
+			t.Fatalf("attached non-platform entry leaked into batch images")
+		}
 		key := img.Entry.Platform.Architecture + "/" + img.Entry.Platform.Variant
 		sizeByVariant[key] = img.TotalSize
+		totalSize += img.TotalSize
 	}
 	for k, art := range map[string]testArtifacts{
 		"amd64/": rich.plats["amd64"], "arm64/v8": rich.plats["v8"], "arm64/v7": rich.plats["v7"]} {
@@ -251,29 +472,44 @@ func TestResolveAllPlatformsBatch(t *testing.T) {
 			t.Fatalf("total size for %s = %d, want %d", k, sizeByVariant[k], len(art.layer))
 		}
 	}
-	t.Logf("final state: 3 platforms ready, each layers=1, sizes=%v; none failed", sizeByVariant)
+	// 总大小只含三个平台层的字节，不含附属条目（24+26 字节）
+	wantTotal := int64(len(rich.plats["amd64"].layer) + len(rich.plats["v8"].layer) +
+		len(rich.plats["v7"].layer))
+	if totalSize != wantTotal {
+		t.Fatalf("aggregated total size = %d, want %d (attached-entry bytes must not count)", totalSize, wantTotal)
+	}
+	t.Logf("final state: 3 platforms ready, each layers=1, sizes=%v total=%d; attached entries absent from counts",
+		sizeByVariant, totalSize)
 }
 
-// TestBatchSelectorsDedupAndUnmatched：条件并集去重；没命中的条件下标与平台失败分开报告。
+// TestBatchSelectorsDedupAndUnmatched：每个条件择优唯一一个平台，重复择优去重；
+// 没选中的条件下标与平台失败分开报告。
 func TestBatchSelectorsDedupAndUnmatched(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(Options{RootDir: dir})
 	defer s.Close()
 	rich := buildRichIndex(t, s, "multi:v1")
-	t.Logf("input: selectors [linux, linux, arm64-v7, windows/amd64] against %s", rich.indexD)
+	t.Logf("input: selectors [arch=arm64, arch=arm64, linux/arm64/v8, windows/amd64] against %s",
+		rich.indexD)
 
 	conds := []*PlatformSelector{
-		NewPlatformSelector().WithOS("linux"), // 命中全部
-		NewPlatformSelector().WithOS("linux"), // 重复条件：同一平台只准备一次
-		NewPlatformSelector().WithOS("linux").WithArchitecture("arm64").WithVariant("v7"),
-		NewPlatformSelector().WithOS("windows"), // 零命中：进入 Unmatched
+		NewPlatformSelector().WithArchitecture("arm64"),                                   // v8/v7 命中，v7 额外特化更少 -> 选 v7
+		NewPlatformSelector().WithArchitecture("arm64"),                                   // 重复择优：v7 只准备一次
+		NewPlatformSelector().WithOS("linux").WithArchitecture("arm64").WithVariant("v8"), // 精确选 v8
+		NewPlatformSelector().WithOS("windows"),                                           // 零命中：进入 Unmatched
 	}
 	res, err := s.BatchResolve(context.Background(), "multi:v1", conds)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Images) != 3 {
-		t.Fatalf("union should dedup to 3 platforms, got %d", len(res.Images))
+	if len(res.Images) != 2 {
+		t.Fatalf("selectors should resolve to distinct {v8, v7}, got %d images", len(res.Images))
+	}
+	got := []string{
+		res.Images[0].Entry.Platform.Variant, res.Images[1].Entry.Platform.Variant,
+	}
+	if fmt.Sprint(got) != "[v8 v7]" {
+		t.Fatalf("judgement basis: prepared order = %v, want [v8 v7] (discovery order)", got)
 	}
 	if fmt.Sprint(res.Unmatched) != "[3]" {
 		t.Fatalf("judgement basis: unmatched = %v, want [3]", res.Unmatched)
@@ -353,9 +589,51 @@ func TestBatchSingleManifest(t *testing.T) {
 		img.LayerCount, img.TotalSize)
 }
 
-// TestBatchConcurrentTagMigrateAndGC：批量解析与标签迁移、删除、GC 真并发：
-// 成功的批量必须每个成功平台都自洽完整；失败必须是可区分的根级错误；
-// 不允许"清单在、层被回收"的悬空结果。
+// checkBatchSelfConsistent 校验一次批量结果的自洽性：
+// 平台级失败必须可区分且不带半成品；成功项的层数汇总一致，且 config/层在
+// 检查时刻仍可读（不允许"清单在、层已被回收"的悬空结果）。
+func checkBatchSelfConsistent(t *testing.T, s *Store, res *BatchResult, bad chan<- error) {
+	t.Helper()
+	for _, img := range res.Images {
+		if img.Err != nil {
+			// 平台级失败必须可区分；失败项不得带半成品
+			if !(errors.Is(img.Err, ErrNotExist) || errors.Is(img.Err, ErrCorrupted) ||
+				errors.Is(img.Err, ErrMediaType) || errors.Is(img.Err, ErrManifestBadJSON) ||
+				errors.Is(img.Err, ErrPlatformBad)) {
+				bad <- fmt.Errorf("platform error not classifiable: %w", img.Err)
+			}
+			if img.Manifest != nil || img.Layers != nil || img.LayerCount != 0 || img.TotalSize != 0 {
+				bad <- fmt.Errorf("half-prepared platform exposed: %s", img.Entry.Platform)
+			}
+			continue
+		}
+		if img.Manifest == nil || img.LayerCount != len(img.Manifest.Layers) {
+			bad <- fmt.Errorf("layer summary inconsistent for %s", img.Entry.Platform)
+			continue
+		}
+		var wantSize int64
+		for _, l := range img.Manifest.Layers {
+			wantSize += l.Size
+		}
+		if img.TotalSize != wantSize {
+			bad <- fmt.Errorf("total size inconsistent for %s: reported=%d recomputed=%d",
+				img.Entry.Platform, img.TotalSize, wantSize)
+		}
+		// 成功项的 config 与每一层必须仍然可读：悬空引用不允许
+		if _, gerr := s.blobData(img.Manifest.Config.Digest); gerr != nil {
+			bad <- fmt.Errorf("config of resolved %s gone: %w", img.Entry.Platform, gerr)
+		}
+		for _, l := range img.Layers {
+			if _, gerr := s.blobData(l.Digest); gerr != nil {
+				bad <- fmt.Errorf("layer of resolved %s gone: %w", img.Entry.Platform, gerr)
+			}
+		}
+	}
+}
+
+// TestBatchConcurrentTagMigrateAndGC：批量解析（"全部平台"与"条件择优"两种）
+// 与标签迁移、删除、GC 真并发：成功的批量必须每个成功平台都自洽完整；
+// 失败必须是可区分的根级错误；不允许"清单在、层被回收"的悬空结果。
 func TestBatchConcurrentTagMigrateAndGC(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(Options{RootDir: dir})
@@ -364,7 +642,13 @@ func TestBatchConcurrentTagMigrateAndGC(t *testing.T) {
 
 	const rounds = 40
 	var wg sync.WaitGroup
-	bad := make(chan error, rounds)
+	bad := make(chan error, rounds*2)
+
+	classifiableRoot := func(err error) bool {
+		return errors.Is(err, ErrLabelNotExist) || errors.Is(err, ErrNotExist) ||
+			errors.Is(err, ErrCorrupted) || errors.Is(err, ErrManifestBadJSON) ||
+			errors.Is(err, ErrMediaType) || errors.Is(err, ErrPlatformBad)
+	}
 
 	for round := 0; round < rounds; round++ {
 		tag := "batch-moving-" + itoa(round)
@@ -385,46 +669,40 @@ func TestBatchConcurrentTagMigrateAndGC(t *testing.T) {
 			}
 		}()
 
-		// 批量解析者
+		// 批量解析者 A：全部平台
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			res, err := s.ResolveAllPlatforms(ctx, tag)
 			if err != nil {
 				// 根级失败必须是可区分的明确原因（标签已删/内容不存在/损坏）
-				if errors.Is(err, ErrLabelNotExist) || errors.Is(err, ErrNotExist) ||
-					errors.Is(err, ErrCorrupted) {
-					return
+				if !classifiableRoot(err) {
+					bad <- fmt.Errorf("batch root error not classifiable: %w", err)
 				}
-				bad <- fmt.Errorf("batch root error not classifiable: %w", err)
 				return
 			}
-			for _, img := range res.Images {
-				if img.Err != nil {
-					// 平台级失败同样必须可区分；失败项不得带半成品
-					if !(errors.Is(img.Err, ErrNotExist) || errors.Is(img.Err, ErrCorrupted) ||
-						errors.Is(img.Err, ErrMediaType) || errors.Is(img.Err, ErrManifestBadJSON)) {
-						bad <- fmt.Errorf("platform error not classifiable: %w", img.Err)
-					}
-					if img.Manifest != nil {
-						bad <- fmt.Errorf("half-prepared platform exposed: %s", img.Entry.Platform)
-					}
-					continue
+			checkBatchSelfConsistent(t, s, res, bad)
+		}()
+
+		// 批量解析者 B：按部分条件择优（只给架构，命中多个时由接口直接选定）
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := s.BatchResolve(ctx, tag,
+				[]*PlatformSelector{NewPlatformSelector().WithArchitecture("arm64")})
+			if err != nil {
+				if !classifiableRoot(err) {
+					bad <- fmt.Errorf("selector batch root error not classifiable: %w", err)
 				}
-				if img.LayerCount != len(img.Manifest.Layers) {
-					bad <- fmt.Errorf("layer summary inconsistent for %s", img.Entry.Platform)
-					continue
-				}
-				// 成功项的 config 与每一层必须仍然可读：悬空引用不允许
-				if _, gerr := s.blobData(img.Manifest.Config.Digest); gerr != nil {
-					bad <- fmt.Errorf("config of resolved %s gone: %w", img.Entry.Platform, gerr)
-				}
-				for _, l := range img.Layers {
-					if _, gerr := s.blobData(l.Digest); gerr != nil {
-						bad <- fmt.Errorf("layer of resolved %s gone: %w", img.Entry.Platform, gerr)
-					}
-				}
+				return
 			}
+			// 至多一个平台（每个条件只择优一个）；Unmatched 只能是空或 [0]
+			if len(res.Images) > 1 || (len(res.Unmatched) != 0 && fmt.Sprint(res.Unmatched) != "[0]") {
+				bad <- fmt.Errorf("selector batch shape invalid: images=%d unmatched=%v",
+					len(res.Images), res.Unmatched)
+				return
+			}
+			checkBatchSelfConsistent(t, s, res, bad)
 		}()
 		wg.Wait()
 	}
@@ -433,7 +711,7 @@ func TestBatchConcurrentTagMigrateAndGC(t *testing.T) {
 		t.Fatalf("race violation: %v", e)
 	}
 	st, _ := s.Stats()
-	t.Logf("final state: %d rounds batch-vs-migrate/delete/GC completed without dangling refs; blobs=%d",
+	t.Logf("final state: %d rounds batch(all+selector)-vs-migrate/delete/GC completed without dangling refs; blobs=%d",
 		rounds, st.BlobCount)
 }
 
@@ -478,12 +756,15 @@ func TestBatchPinnedContentNotCollected(t *testing.T) {
 		defer wg.Done()
 		defer close(done) // 批量一结束就停止 GC：本测试只保证"进行中"不被回收
 		res, err := s.BatchResolve(ctx, rich.indexD.String(),
-			[]*PlatformSelector{NewPlatformSelector().WithArchitecture("arm64")})
+			[]*PlatformSelector{
+				NewPlatformSelector().WithArchitecture("arm64").WithVariant("v8"),
+				NewPlatformSelector().WithArchitecture("arm64").WithVariant("v7"),
+			})
 		if err != nil {
 			bad <- err
 			return
 		}
-		if len(res.Images) != 2 { // v8 + v7
+		if len(res.Images) != 2 { // 两个条件分别择优到 v8、v7
 			bad <- fmt.Errorf("want 2 arm64 platforms, got %d", len(res.Images))
 			return
 		}
